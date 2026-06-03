@@ -58,7 +58,7 @@ def search(
 
     try:
         # Navigate to advanced search
-        page.goto(SEARCH_URL, timeout=30, wait_until="domcontentloaded")
+        page.goto(SEARCH_URL, timeout=30000, wait_until="domcontentloaded")
 
         # Handle captcha
         if "verify" in page.url.lower():
@@ -67,7 +67,7 @@ def search(
                 logger.error("Captcha not solved in time")
                 return []
             # Re-navigate after captcha
-            page.goto(SEARCH_URL, timeout=30, wait_until="domcontentloaded")
+            page.goto(SEARCH_URL, timeout=30000, wait_until="domcontentloaded")
 
         logger.info(f"Searching CNKI for: {kw_str} ({from_year}-{to_year})")
 
@@ -79,7 +79,7 @@ def search(
         except Exception:
             # Fallback: use the simple search on homepage
             page.goto(f"{CNKI_HOME}/kns8s/defaultresult/index?kwd={kw_str}",
-                      timeout=30)
+                      timeout=30000)
             page.wait_for_timeout(3000)
 
         # Click search
@@ -187,7 +187,7 @@ def get_download_url(detail_url: str) -> Optional[str]:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
         try:
-            page.goto(detail_url, timeout=30, wait_until="domcontentloaded")
+            page.goto(detail_url, timeout=30000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
             # Look for download link

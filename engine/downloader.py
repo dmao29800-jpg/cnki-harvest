@@ -50,7 +50,7 @@ class DownloadController:
                 page = browser.new_page()
                 # Listen for downloads
                 with page.expect_download(timeout=60000) as dl_info:
-                    page.goto(detail_url, timeout=30)
+                    page.goto(detail_url, timeout=30000)
                     # Try clicking download button
                     dl_btn = page.locator(
                         "a[onclick*='download'], a.downloadlink, "
