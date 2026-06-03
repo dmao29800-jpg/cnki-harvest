@@ -1,39 +1,41 @@
 """
-CNKI advanced search + metadata extraction.
-Uses requests + BeautifulSoup against kns.cnki.net.
+CNKI search via Playwright headful browser.
+Handles captcha by showing browser window for manual solve.
 """
-import re
-import time
-import logging
+import re, time, logging
 from typing import Optional
-from urllib.parse import urlencode
-
-import requests
-from bs4 import BeautifulSoup
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-CNKI_BASE = "https://kns.cnki.net"
-SEARCH_URL = f"{CNKI_BASE}/kns8s/Brief/Result"
-
-# Session management
-SESSION = None
+CNKI_HOME = "https://kns.cnki.net"
+SEARCH_URL = f"{CNKI_HOME}/kns8s/AdvSearch"
 
 
-def _get_session() -> requests.Session:
-    global SESSION
-    if SESSION is None:
-        SESSION = requests.Session()
-        SESSION.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        })
-        # Prime the session with a GET to the search page
-        try:
-            SESSION.get(f"{CNKI_BASE}/kns8s/AdvSearch", timeout=15)
-        except Exception:
-            pass
-    return SESSION
+def _launch_browser():
+    """Launch Playwright browser (visible, so user can solve captcha)."""
+    from playwright.sync_api import sync_playwright
+    p = sync_playwright().start()
+    browser = p.chromium.launch(
+        headless=False,  # visible for captcha
+        args=["--disable-blink-features=AutomationControlled"],
+    )
+    ctx = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 800},
+    )
+    page = ctx.new_page()
+    return p, browser, ctx, page
+
+
+def _handle_captcha(page, timeout=30):
+    """Wait for user to solve captcha if present."""
+    for _ in range(timeout):
+        if "verify" not in page.url.lower():
+            return True
+        time.sleep(1)
+    return False
 
 
 def search(
@@ -43,176 +45,162 @@ def search(
     core_only: bool = False,
     core_journals: Optional[list[str]] = None,
     max_results: int = 300,
-    page_size: int = 50,
+    page_size: int = 20,
 ) -> list[dict]:
     """
-    Search CNKI and return paper metadata.
-
-    Args:
-        keywords: List of Chinese keywords (AND logic within group, OR between groups).
-        from_year: Start year.
-        to_year: End year.
-        core_only: If True, only return papers from core journals.
-        core_journals: List of core journal names to filter by.
-        max_results: Max papers to return.
-        page_size: Results per page (max 50).
-
-    Returns:
-        List of dicts with keys: title, authors, journal, year, abstract,
-                                 keywords, download_url, detail_url, is_core
+    Search CNKI with Playwright browser. Opens visible window.
+    If captcha appears, user can solve it manually.
     """
-    session = _get_session()
+    kw_str = " ".join(keywords[:8])
+
+    p, browser, ctx, page = _launch_browser()
     papers = []
-    kw_str = " + ".join(keywords[:5])  # CNKI limits keyword length
 
-    for page in range(1, (max_results // page_size) + 2):
-        if len(papers) >= max_results:
-            break
+    try:
+        # Navigate to advanced search
+        page.goto(SEARCH_URL, timeout=30, wait_until="domcontentloaded")
 
-        params = _build_search_params(kw_str, from_year, to_year, page, page_size)
+        # Handle captcha
+        if "verify" in page.url.lower():
+            logger.warning("Captcha detected — please solve it in the browser window")
+            if not _handle_captcha(page):
+                logger.error("Captcha not solved in time")
+                return []
+            # Re-navigate after captcha
+            page.goto(SEARCH_URL, timeout=30, wait_until="domcontentloaded")
+
+        logger.info(f"Searching CNKI for: {kw_str} ({from_year}-{to_year})")
+
+        # Fill search form
         try:
-            resp = session.post(SEARCH_URL, data=params, timeout=30)
-            resp.encoding = "utf-8"
-        except requests.RequestException as e:
-            logger.error(f"Search failed page {page}: {e}")
-            break
+            search_input = page.locator("textarea#gradsearch, input#gradsearch, "
+                                        "textarea.search-input, input.search-input").first
+            search_input.fill(kw_str)
+        except Exception:
+            # Fallback: use the simple search on homepage
+            page.goto(f"{CNKI_HOME}/kns8s/defaultresult/index?kwd={kw_str}",
+                      timeout=30)
+            page.wait_for_timeout(3000)
 
-        page_papers = _parse_search_results(resp.text, core_journals if core_only else None)
-        if not page_papers:
-            break
+        # Click search
+        try:
+            page.locator("input[type=submit], button.search-btn, "
+                         "input[value*='检索'], .search-btn").first.click()
+        except Exception:
+            page.keyboard.press("Enter")
 
-        papers.extend(page_papers)
-        logger.info(f"  Page {page}: found {len(page_papers)} papers (total: {len(papers)})")
+        page.wait_for_timeout(5000)
 
-        if len(page_papers) < page_size:
-            break  # last page
+        # Parse results across pages
+        for pg in range(1, (max_results // page_size) + 2):
+            if len(papers) >= max_results:
+                break
 
-        time.sleep(2)  # Be polite to CNKI
+            page_papers = _parse_page(page, core_journals if core_only else None)
+            if not page_papers:
+                break
+
+            papers.extend(page_papers)
+            logger.info(f"  Page {pg}: {len(page_papers)} papers (total: {len(papers)})")
+
+            if len(page_papers) < page_size:
+                break
+
+            # Next page
+            try:
+                next_btn = page.locator("a:has-text('下一页'), a.next, "
+                                        ".pager a:has-text('>')").first
+                if next_btn.is_visible():
+                    next_btn.click()
+                    page.wait_for_timeout(3000)
+                else:
+                    break
+            except Exception:
+                break
+
+    finally:
+        browser.close()
+        p.stop()
 
     return papers[:max_results]
 
 
-def _build_search_params(
-    kw_str: str, from_year: int, to_year: int, page: int, page_size: int
-) -> dict:
-    """Build CNKI advanced search POST params."""
-    # CNKI's internal search parameter format
-    return {
-        "boolSearch": "true",
-        "QueryJson": str({
-            "Platform": "",
-            "Resource": "CJFQ,CDFD,CMFD,CPFD",  # Journal, Doctoral, Master, Conference
-            "Classid": "YSTT4HG0",
-            "SearchType": "Advanced",
-            "QNode": {
-                "SearchType": 2,
-                "SearchNodeList": [{
-                    "NodeID": 1,
-                    "Field": "SU$%=|''",
-                    "Logic": 1,
-                    "FieldName": "主题",
-                    "SearchType": "2",
-                    "KeyType": "keyword",
-                    "SearchWord": kw_str,
-                    "IsAdvancedSearch": "1",
-                }]
-            },
-            "SearchCondition": [
-                {"Field": "CF", "FieldName": "年份", "SearchType": "2",
-                 "Logic": "1", "SearchWord": f"{from_year}-{to_year}"}
-            ],
-            "Page": page,
-            "PageSize": page_size,
-            "Sort": "RELEVANCE",
-        }).replace("'", '"'),
-    }
-
-
-def _parse_search_results(html: str, core_journals: Optional[list[str]]) -> list[dict]:
-    """Parse CNKI search result HTML into paper metadata list."""
-    soup = BeautifulSoup(html, "html.parser")
+def _parse_page(page, core_list: Optional[list[str]]) -> list[dict]:
+    """Extract paper metadata from current search result page."""
     papers = []
 
-    # Find result rows
-    rows = soup.select("tr.result, table.result-table tr, .result-item, .result-table-list tr")
-    if not rows:
-        rows = soup.find_all("tr", attrs={"class": re.compile(r".*result.*|.*list.*")})
-    if not rows:
-        # Fallback: look for title links
-        rows = soup.select("a[href*='Detail'], a.fz14, td.name a")
+    # Try multiple selectors for result rows
+    rows = page.locator("table.result-table-list tr, tr.result, "
+                        "td.result-source-list table tr, "
+                        ".result-detail, .result-table-list tr")
+    if rows.count() == 0:
+        rows = page.locator("a.fz14")
 
-    for row in rows:
-        title_el = row.select_one("a.fz14, a[href*='Detail'], td.name a")
-        if not title_el:
+    for i in range(min(rows.count(), 50)):
+        try:
+            row = rows.nth(i)
+            # Title link
+            title_el = row.locator("a.fz14, td.name a, a[href*='Detail']").first
+            if not title_el.is_visible():
+                continue
+            title = title_el.inner_text().strip()
+            if not title or len(title) < 3:
+                continue
+
+            href = title_el.get_attribute("href") or ""
+            detail_url = href if href.startswith("http") else f"{CNKI_HOME}{href}"
+
+            # Authors & journal from row text
+            row_text = row.inner_text()
+            lines = [l.strip() for l in row_text.split("\n") if l.strip()]
+
+            authors = lines[1] if len(lines) > 1 else ""
+            journal = lines[2] if len(lines) > 2 else ""
+            year = ""
+            for part in lines:
+                m = re.search(r"(\d{4})", part)
+                if m:
+                    year = m.group(1)
+                    break
+
+            is_core = any(j in journal for j in core_list) if core_list else False
+
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "journal": journal,
+                "year": year,
+                "detail_url": detail_url,
+                "is_core": is_core,
+            })
+        except Exception:
             continue
-        title = title_el.get_text(strip=True)
-        if not title or len(title) < 3:
-            continue
-
-        href = title_el.get("href", "")
-        detail_url = href if href.startswith("http") else f"{CNKI_BASE}{href}"
-
-        # Extract other fields from nearby cells
-        cells = row.find_all("td") if row.name == "tr" else []
-        # Authors usually in 2nd cell, journal in 3rd
-        authors = ""
-        journal = ""
-        year = ""
-        if len(cells) >= 3:
-            authors = cells[1].get_text(strip=True) if len(cells) > 1 else ""
-            journal = cells[2].get_text(strip=True) if len(cells) > 2 else ""
-        if len(cells) >= 4:
-            year_text = cells[3].get_text(strip=True) if len(cells) > 3 else ""
-            year_match = re.search(r"(\d{4})", year_text)
-            year = year_match.group(1) if year_match else ""
-
-        # Core journal check
-        is_core = False
-        if core_journals and journal:
-            is_core = any(j in journal for j in core_journals)
-
-        papers.append({
-            "title": title,
-            "authors": authors,
-            "journal": journal,
-            "year": year,
-            "detail_url": detail_url,
-            "is_core": is_core,
-        })
 
     return papers
 
 
 def get_download_url(detail_url: str) -> Optional[str]:
     """Visit paper detail page and extract PDF download URL."""
-    session = _get_session()
-    try:
-        resp = session.get(detail_url, timeout=20)
-        resp.encoding = "utf-8"
-    except requests.RequestException as e:
-        logger.warning(f"Failed to load detail page: {e}")
-        return None
+    from playwright.sync_api import sync_playwright
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    # CNKI download links
-    patterns = [
-        "a[onclick*='download']",
-        "a.downloadlink",
-        "a[href*='download']",
-        "a[href$='.pdf']",
-        "a[href*='DownLoad']",
-    ]
-    for pat in patterns:
-        link = soup.select_one(pat)
-        if link:
-            href = link.get("href", "")
-            if href:
-                return href if href.startswith("http") else f"{CNKI_BASE}{href}"
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        page = browser.new_page()
+        try:
+            page.goto(detail_url, timeout=30, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
 
-    # Try regex fallback
-    m = re.search(r'(/kns8[^"\']*?down[^"\']*?\.(?:pdf|aspx)[^"\']*?)', resp.text, re.I)
-    if m:
-        path = m.group(1)
-        return path if path.startswith("http") else f"{CNKI_BASE}{path}"
+            # Look for download link
+            dl = page.locator(
+                "a[onclick*='download'], a.downloadlink, "
+                "a[href*='download'], a[href$='.pdf'], "
+                "a:has-text('PDF'), a:has-text('下载')"
+            ).first
+            if dl.is_visible():
+                return dl.get_attribute("href") or ""
+        except Exception:
+            pass
+        finally:
+            browser.close()
 
     return None
