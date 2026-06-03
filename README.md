@@ -42,4 +42,4 @@ python cli.py -d 材料科学与工程 -n 300 -o ./材料论文
 
 PDF 命名格式：`{年份}_{期刊}_{标题}_{第一作者}.pdf`
 
-可直接作为 paper-distill 输入目录使用。
+下载完直接喂给 **[Paper Distill](https://github.com/dmao29800-jpg/paper-distill)** 做知识蒸馏。
